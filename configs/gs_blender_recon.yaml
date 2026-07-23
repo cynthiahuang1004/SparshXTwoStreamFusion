@@ -1,6 +1,6 @@
 seed: 0
 device: auto
-output_dir: outputs/gs_blender_recon
+output_dir: outputs/SparshX
 
 data:
   dataset: gs_blender

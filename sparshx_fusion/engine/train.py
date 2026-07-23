@@ -278,7 +278,12 @@ def main():
     scheduler = build_scheduler(optimizer, warmup_steps, total_steps,
                                 min_lr_ratio=train_cfg.get("min_lr_ratio", 0.01))
 
-    output_dir = Path(cfg["output_dir"])
+    from datetime import datetime
+    base_output_dir = cfg["output_dir"]
+    date_prefix = datetime.now().strftime("%Y%m%d")
+    if not Path(base_output_dir).name.startswith(date_prefix):
+        base_output_dir = str(Path(base_output_dir).parent / f"{date_prefix}_SparshX")
+    output_dir = Path(base_output_dir)
     if is_main_process():
         output_dir.mkdir(parents=True, exist_ok=True)
 
