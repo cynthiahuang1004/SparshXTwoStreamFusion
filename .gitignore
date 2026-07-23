@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Model weights (large; keep out of git)
+weights/
+weights
+*.pth
+*.pt
+
+# Training outputs
+outputs/

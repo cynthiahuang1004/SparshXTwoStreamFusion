@@ -1,0 +1,52 @@
+seed: 42
+device: auto
+output_dir: outputs/gs_blender
+
+data:
+  dataset: gs_blender       # synthetic | paired_folder | gs_blender
+  image_size: 224
+  num_classes: 4            # unused for regression, kept for model kwargs
+  regression_dim: 3
+  gs_blender:
+    root: /media/hdd2/ihsuan/gs_blender/renders
+    rgb_dir: rgb            # object appearance images
+    tactile_dir: samples    # tactile images
+    raw_dir: raw_data       # holds <stem>_pose.json
+    target_key: location    # location | sample_xyz | sample_xy | rotation_euler
+    val_ratio: 0.2          # fraction of (object, session) groups held out
+    stats_samples: 5000     # subset size for target mean/std estimation
+    augment: true           # train-only photometric domain randomization (label-preserving)
+
+model:
+  image_size: 224
+  patch_size: 16
+  in_chans: 3
+  embed_dim: 192
+  depth: 8
+  num_heads: 3
+  mlp_ratio: 4
+  independent_layers: 4
+  fusion_layers: 4
+  num_bottleneck_tokens: 8
+  dropout: 0.1
+  task: regression          # end-to-end 3D pose regression
+  num_classes: 4
+  regression_dim: 3
+  head_hidden_dim: 384
+  head_layers: 2
+  head_dropout: 0.1
+  encoder:                  # frozen DINOv3 token extractor (VisTacFusion method)
+    name: dinov3_vitl16
+    checkpoint: /media/hdd2/xiangdong/SparshXTwoStreamFusion/weights/dinov3_vitl16_pretrain_lvd1689m.pth
+    embed_dim: 1024         # ViT-L native dim (inferred from ckpt anyway)
+    patch_size: 16
+    share_encoder_weights: true
+
+train:
+  epochs: 20
+  batch_size: 64
+  num_workers: 8
+  lr: 0.0003
+  weight_decay: 0.05
+  log_every: 50
+  amp: true

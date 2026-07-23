@@ -1,0 +1,83 @@
+seed: 0
+device: auto
+output_dir: outputs/gs_blender_recon
+
+data:
+  dataset: gs_blender
+  image_size: 224
+  num_classes: 4
+  regression_dim: 3
+  gs_blender:
+    root: /media/hdd2/ihsuan/gs_blender/renders
+    mesh_dir: /media/hdd2/ihsuan/gs_blender/meshes
+    rgb_dir: rgb
+    tactile_dir: samples
+    raw_dir: raw_data
+    use_gt_depth: true
+    depth_scale: 1000.0
+    val_every: 20
+    augment: true
+    rot_augment: true
+    rot_augment_max_deg: 180.0
+    gel_view_m: 0.017502
+
+model:
+  image_size: 224
+  patch_size: 16
+  in_chans: 3
+  embed_dim: 768
+  depth: 8
+  num_heads: 8
+  mlp_ratio: 4
+  independent_layers: 4
+  fusion_layers: 4
+  num_bottleneck_tokens: 16
+  dropout: 0.1
+  task: reconstruction
+  num_classes: 4
+  regression_dim: 3
+  encoder:
+    name: dinov3_vitl16
+    checkpoint: weights/dinov3_vitl16_pretrain_lvd1689m.pth
+    embed_dim: 1024
+    patch_size: 16
+    share_encoder_weights: true
+  dpt:
+    features: 256
+    dropout: 0.1
+    out_depth_channels: 1
+    out_normal_channels: 3
+  pose:
+    hidden_dim: 256
+    dropout: 0.1
+    pose_mode: regression
+    rot_num_bins: 72
+    use_spatial_pool: true
+
+# VisTacFusion-style multi-task loss (depth + normal + pose)
+loss:
+  depth:
+    type: mse
+    grad_matching_weight: 0.0
+    weight: 1.0
+  normal:
+    type: mse
+    weight: 1.0
+  pose:
+    rot_weight: 1.0
+    trans_weight: 1.0
+    weight: 1.0
+  uncertainty_weighting: true
+  grouped_uncertainty: true
+  dense_pose_ratio: 1.0
+
+train:
+  epochs: 150
+  batch_size: 64
+  num_workers: 8
+  lr: 0.0002
+  weight_decay: 0.05
+  warmup_steps: 1000
+  min_lr_ratio: 0.01
+  log_every: 50
+  amp: true

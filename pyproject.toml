@@ -1,0 +1,15 @@
+[project]
+name = "sparshx-two-stream-fusion"
+version = "0.1.0"
+description = "Two-stream shared-bottleneck visuo-tactile fusion baseline"
+requires-python = ">=3.9"
+dependencies = [
+  "torch",
+  "torchvision",
+  "pyyaml",
+  "pillow",
+]
+
+[tool.setuptools.packages.find]
+include = ["sparshx_fusion*"]
+

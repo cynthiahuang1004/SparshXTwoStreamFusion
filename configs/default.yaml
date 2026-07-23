@@ -1,0 +1,52 @@
+seed: 42
+device: auto
+output_dir: outputs
+
+data:
+  dataset: synthetic        # synthetic | paired_folder
+  image_size: 224
+  num_classes: 4
+  regression_dim: 3
+  synthetic:
+    train_samples: 512
+    val_samples: 128
+  paired_folder:
+    root: null
+    rgb_dir: rgb
+    tactile_dir: tactile
+    labels_csv: labels.csv
+
+model:
+  image_size: 224
+  patch_size: 16
+  in_chans: 3
+  embed_dim: 192
+  depth: 8
+  num_heads: 3
+  mlp_ratio: 4
+  independent_layers: 4
+  fusion_layers: 4
+  num_bottleneck_tokens: 8
+  dropout: 0.1
+  task: classification      # classification | regression | embedding
+  num_classes: 4
+  regression_dim: 3
+  head_hidden_dim: 384      # MLP decoder hidden width (null -> = fused_dim = embed_dim*3)
+  head_layers: 2            # 1 = linear probe, 2-3 = MLP decoder
+  head_dropout: 0.1
+  encoder:                  # frozen token extractor (same DINO method as VisTacFusion)
+    name: dinov3_vitl16
+    checkpoint: null        # null -> MockEncoder (CPU/tests); set a path for real DINOv3
+    embed_dim: 1024         # encoder native dim E (mock uses this; DINO infers from ckpt)
+    patch_size: 16
+    share_encoder_weights: true
+
+train:
+  epochs: 5
+  batch_size: 16
+  num_workers: 0
+  lr: 0.0003
+  weight_decay: 0.05
+  log_every: 20
+  amp: false
+

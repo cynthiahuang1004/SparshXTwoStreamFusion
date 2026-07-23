@@ -1,0 +1,43 @@
+seed: 42
+device: auto
+output_dir: outputs_smoke
+
+data:
+  dataset: synthetic
+  image_size: 64
+  num_classes: 4
+  regression_dim: 3
+  synthetic:
+    train_samples: 32
+    val_samples: 16
+  paired_folder:
+    root: null
+    rgb_dir: rgb
+    tactile_dir: tactile
+    labels_csv: labels.csv
+
+model:
+  image_size: 64
+  patch_size: 16
+  in_chans: 3
+  embed_dim: 64
+  depth: 4
+  num_heads: 4
+  mlp_ratio: 4
+  independent_layers: 2
+  fusion_layers: 2
+  num_bottleneck_tokens: 4
+  dropout: 0.0
+  task: classification
+  num_classes: 4
+  regression_dim: 3
+
+train:
+  epochs: 1
+  batch_size: 8
+  num_workers: 0
+  lr: 0.0003
+  weight_decay: 0.05
+  log_every: 1
+  amp: false
+

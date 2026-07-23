@@ -1,0 +1,64 @@
+seed: 42
+device: auto
+output_dir: outputs_smoke_recon
+
+data:
+  dataset: synthetic
+  image_size: 64
+  num_classes: 4
+  regression_dim: 3
+  synthetic:
+    train_samples: 16
+    val_samples: 8
+
+model:
+  image_size: 64
+  patch_size: 16
+  in_chans: 3
+  embed_dim: 64
+  depth: 4
+  num_heads: 4
+  mlp_ratio: 4
+  independent_layers: 2
+  fusion_layers: 2
+  num_bottleneck_tokens: 4
+  dropout: 0.0
+  task: reconstruction
+  num_classes: 4
+  regression_dim: 3
+  encoder:
+    checkpoint: null
+    embed_dim: 64
+    patch_size: 16
+    share_encoder_weights: true
+  dpt:
+    features: 32
+    dropout: 0.0
+    out_depth_channels: 1
+    out_normal_channels: 3
+  pose:
+    hidden_dim: 64
+    dropout: 0.0
+    pose_mode: regression
+
+loss:
+  depth:
+    type: mse
+    weight: 1.0
+  normal:
+    type: mse
+    weight: 1.0
+  pose:
+    rot_weight: 1.0
+    trans_weight: 1.0
+    weight: 1.0
+  uncertainty_weighting: true
+
+train:
+  epochs: 1
+  batch_size: 4
+  num_workers: 0
+  lr: 0.0003
+  weight_decay: 0.05
+  log_every: 1
+  amp: false
