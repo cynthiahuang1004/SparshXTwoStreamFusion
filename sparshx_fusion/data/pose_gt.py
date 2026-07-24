@@ -70,14 +70,22 @@ def build_unit_pose_meta(
         return None
     with Path(session_json).open() as f:
         sess = json.load(f)
-    x_min, x_max = sess["X_MIN"], sess["X_MAX"]
-    y_min, y_max = sess["Y_MIN"], sess["Y_MAX"]
     base_rot = sess["base_rotation"]
     delta_rz = base_rot[2] - info["rz0"]
     session_center = get_session_center(info["vertices"], info["fixed_scale"], base_rot)
+    if "X_MIN" in sess:
+        x_min, x_max = sess["X_MIN"], sess["X_MAX"]
+        y_min, y_max = sess["Y_MIN"], sess["Y_MAX"]
+        pixel_size_x = (x_max - x_min) / image_size
+        pixel_size_y = (y_max - y_min) / image_size
+    else:
+        target_size = sess.get("_target_size_mm", 82.0)
+        view_m = target_size / 1000.0
+        pixel_size_x = view_m / image_size
+        pixel_size_y = view_m / image_size
     return {
-        "pixel_size_x": (x_max - x_min) / image_size,
-        "pixel_size_y": (y_max - y_min) / image_size,
+        "pixel_size_x": pixel_size_x,
+        "pixel_size_y": pixel_size_y,
         "delta_rz": delta_rz,
         "rz0": info["rz0"],
         "session_center": session_center,

@@ -528,6 +528,92 @@ def _build_gs_blender_recon(cfg: Any, image_size: int):
     return train_ds, val_ds
 
 
+def _build_gs_blender_recon_sim_real(cfg: Any, image_size: int):
+    """Build (train_ds, val_ds) for sim+real co-training.
+
+    Sim data: augmented, with rendered normals.
+    Real data: no augmentation, no rendered normals, oversampled.
+    Val = real val only (to measure real-data generalization).
+    """
+    from torch.utils.data import ConcatDataset
+
+    sim_cfg = cfg["data"]["gs_blender"]
+    real_cfg = cfg["data"]["real"]
+
+    # ---- Sim datasets ----
+    sim_groups = scan_gs_blender(
+        sim_cfg["root"],
+        rgb_dir=sim_cfg.get("rgb_dir", "rgb"),
+        tactile_dir=sim_cfg.get("tactile_dir", "samples"),
+        raw_dir=sim_cfg.get("raw_dir", "raw_data"),
+        require_depth=True,
+        use_gt_depth=sim_cfg.get("use_gt_depth", True),
+    )
+    val_every = sim_cfg.get("val_every", 20)
+    sim_all = [s for k in sorted(sim_groups.keys()) for s in sim_groups[k]]
+    sim_train_samples = [s for s in sim_all if int(Path(s["rgb"]).stem) % val_every != 0]
+    sim_val_samples = [s for s in sim_all if int(Path(s["rgb"]).stem) % val_every == 0]
+
+    depth_scale = sim_cfg.get("depth_scale", 1000.0)
+    mesh_dir = sim_cfg.get("mesh_dir")
+    gel_view_m = sim_cfg.get("gel_view_m", 0.017502)
+
+    sim_train_ds = GsBlenderDepthDataset(
+        sim_train_samples, root=sim_cfg["root"], image_size=image_size,
+        depth_scale=depth_scale, mesh_dir=mesh_dir,
+        augment=sim_cfg.get("augment", True),
+        tactile_aug_params=sim_cfg.get("tactile_aug_params"),
+        rot_augment=sim_cfg.get("rot_augment", True),
+        rot_augment_max_deg=sim_cfg.get("rot_augment_max_deg", 180.0),
+        gel_view_m=gel_view_m,
+        use_rendered_normals=sim_cfg.get("use_rendered_normals", True),
+        use_gt_depth=sim_cfg.get("use_gt_depth", True),
+    )
+
+    # ---- Real datasets ----
+    real_groups = scan_gs_blender(
+        real_cfg["root"],
+        rgb_dir=real_cfg.get("rgb_dir", "rgb"),
+        tactile_dir=real_cfg.get("tactile_dir", "samples"),
+        raw_dir=real_cfg.get("raw_dir", "raw_data"),
+        require_depth=True,
+        use_gt_depth=real_cfg.get("use_gt_depth", True),
+    )
+    real_val_every = real_cfg.get("val_every", 20)
+    real_all = [s for k in sorted(real_groups.keys()) for s in real_groups[k]]
+    real_train_samples = [s for s in real_all if int(Path(s["rgb"]).stem) % real_val_every != 0]
+    real_val_samples = [s for s in real_all if int(Path(s["rgb"]).stem) % real_val_every == 0]
+
+    real_mesh_dir = real_cfg.get("mesh_dir", mesh_dir)
+    real_train_ds = GsBlenderDepthDataset(
+        real_train_samples, root=real_cfg["root"], image_size=image_size,
+        depth_scale=depth_scale, mesh_dir=real_mesh_dir,
+        augment=False, gel_view_m=gel_view_m,
+        use_rendered_normals=False,
+        use_gt_depth=real_cfg.get("use_gt_depth", True),
+    )
+    real_val_ds = GsBlenderDepthDataset(
+        real_val_samples, root=real_cfg["root"], image_size=image_size,
+        depth_scale=depth_scale, mesh_dir=real_mesh_dir,
+        augment=False, gel_view_m=gel_view_m,
+        use_rendered_normals=False,
+        use_gt_depth=real_cfg.get("use_gt_depth", True),
+    )
+
+    # Oversample real data to balance with sim
+    oversample = real_cfg.get("oversample", 0)
+    if oversample <= 0:
+        oversample = max(1, len(sim_train_samples) // max(1, len(real_train_samples)) // 2)
+
+    train_ds = ConcatDataset([sim_train_ds] + [real_train_ds] * oversample)
+    val_ds = real_val_ds
+
+    print(f"sim+real co-training: sim={len(sim_train_samples)}+{len(sim_val_samples)}, "
+          f"real={len(real_train_samples)}+{len(real_val_samples)} (oversample {oversample}x)")
+    print(f"  train total={len(train_ds)}, val={len(val_ds)} (real only)")
+    return train_ds, val_ds
+
+
 def build_dataloaders(cfg: Any, distributed: bool = False) -> tuple[DataLoader, DataLoader]:
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
@@ -567,6 +653,8 @@ def build_dataloaders(cfg: Any, distributed: bool = False) -> tuple[DataLoader, 
         train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=torch.Generator().manual_seed(cfg["seed"]))
     elif data_cfg["dataset"] == "gs_blender" and task == "reconstruction":
         train_ds, val_ds = _build_gs_blender_recon(cfg, image_size)
+    elif data_cfg["dataset"] == "gs_blender_sim_real" and task == "reconstruction":
+        train_ds, val_ds = _build_gs_blender_recon_sim_real(cfg, image_size)
     elif data_cfg["dataset"] == "gs_blender":
         gb = data_cfg["gs_blender"]
         target_key = gb.get("target_key", "location")
