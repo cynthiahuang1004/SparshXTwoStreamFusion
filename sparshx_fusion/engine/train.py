@@ -1,4 +1,4 @@
-"""Training loop with multi-GPU DDP support.
+"""Training loop with modality dropout + multi-GPU DDP support.
 
 Single GPU:
     python -m sparshx_fusion.engine.train --config configs/gs_blender_recon.yaml
@@ -10,8 +10,10 @@ Multi-GPU (e.g. 2 GPUs):
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import random
 from pathlib import Path
 
 import torch
@@ -44,6 +46,29 @@ def setup_distributed():
     world_size = dist.get_world_size()
     torch.cuda.set_device(local_rank)
     return torch.device(f"cuda:{local_rank}"), rank, world_size
+
+
+def sample_config(md_cfg: dict) -> str:
+    if not md_cfg.get("enabled", False):
+        return "both"
+    r = random.random()
+    p_both = md_cfg.get("p_both", 0.5)
+    p_tac = md_cfg.get("p_tactile_only", 0.25)
+    if r < p_both:
+        return "both"
+    if r < p_both + p_tac:
+        return "tactile"
+    return "rgb"
+
+
+def sync_config(config: str, device) -> str:
+    if not is_distributed():
+        return config
+    mapping = {"both": 0, "tactile": 1, "rgb": 2}
+    reverse = {0: "both", 1: "tactile", 2: "rgb"}
+    t = torch.tensor([mapping[config]], device=device)
+    dist.broadcast(t, src=0)
+    return reverse[t.item()]
 
 
 def build_model_from_cfg(cfg: dict) -> SparshXTwoStreamFusionModel:
@@ -120,15 +145,20 @@ def build_scheduler(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01):
 
 
 def train_one_epoch(model, loader, optimizer, scaler, device, task: str, amp: bool, log_every: int,
-                    epoch: int, criterion=None, scheduler=None):
+                    epoch: int, criterion=None, scheduler=None, md_cfg=None):
     model.train()
+    md_cfg = md_cfg or {}
     running = {"total": 0.0}
     for step, batch in enumerate(loader):
         batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
                  for k, v in batch.items()}
+
+        config = sample_config(md_cfg)
+        config = sync_config(config, device)
+
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
-            out = model(batch["rgb"], batch["tactile"])
+            out = model(batch["rgb"], batch["tactile"], config=config)
             if task == "reconstruction":
                 loss, comps = criterion(_model_pred(out), batch)
             else:
@@ -154,7 +184,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, task: str, amp: bo
         for k, v in comps.items():
             running[k] = running.get(k, 0.0) + float(v)
         if is_main_process() and step % log_every == 0:
-            msg = f"epoch={epoch:03d} step={step:04d}/{len(loader)} loss={loss.item():.4f}"
+            msg = f"epoch={epoch:03d} step={step:04d}/{len(loader)} cfg={config:7s} loss={loss.item():.4f}"
             if task == "reconstruction":
                 parts = " ".join(f"{k}={comps[k].item():.4f}" for k in sorted(comps) if k != "total")
                 if parts:
@@ -165,9 +195,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, task: str, amp: bo
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, task: str, target_std=None, criterion=None):
-    model.eval()
-    raw_model = model.module if isinstance(model, DDP) else model
+def _evaluate_one_config(raw_model, loader, device, task, criterion, config="both"):
     running = {"loss": 0.0}
     correct = count = 0
     abs_err_sum = None
@@ -178,7 +206,7 @@ def evaluate(model, loader, device, task: str, target_std=None, criterion=None):
     for batch in loader:
         batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
                  for k, v in batch.items()}
-        out = raw_model(batch["rgb"], batch["tactile"])
+        out = raw_model(batch["rgb"], batch["tactile"], config=config)
         if task == "reconstruction":
             loss, comps = criterion(_model_pred(out), batch)
             running["loss"] += loss.item()
@@ -218,12 +246,65 @@ def evaluate(model, loader, device, task: str, target_std=None, criterion=None):
     elif task == "regression" and abs_err_sum is not None:
         mae_norm = abs_err_sum / max(1, n_samples)
         metrics["mae_norm"] = round(mae_norm.mean().item(), 5)
-        if target_std is not None:
-            std = torch.as_tensor(target_std, device=mae_norm.device, dtype=mae_norm.dtype)
-            mae_orig = mae_norm * std
-            metrics["mae"] = round(mae_orig.mean().item(), 6)
-            metrics["mae_per_axis"] = [round(v, 6) for v in mae_orig.tolist()]
     return metrics
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, task: str, target_std=None, criterion=None):
+    model.eval()
+    raw_model = model.module if isinstance(model, DDP) else model
+    if task != "reconstruction":
+        return _evaluate_one_config(raw_model, loader, device, task, criterion)
+    results = {}
+    for config in ("both", "tactile", "rgb"):
+        results[config] = _evaluate_one_config(raw_model, loader, device, task, criterion, config)
+    return results
+
+
+def plot_curves(history: list[dict], output_dir: Path) -> None:
+    """Save loss-curve PNGs from accumulated epoch history."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    epochs = [h["epoch"] for h in history]
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+
+    # --- 1. Combined train/val loss ---
+    train_loss = [h["train_loss"] for h in history]
+    val_loss = [h["val_loss"] for h in history]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, train_loss, label="train loss")
+    ax.plot(epochs, val_loss, label="val loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Train / Val Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(plots_dir / "loss_curves.png", dpi=150)
+    plt.close(fig)
+
+    # --- 2. Individual metric plots (reconstruction only) ---
+    metric_keys = {
+        "depth_mse": ("Depth MSE", "Depth MSE"),
+        "normal_mean_angle": ("Normal Mean Angle (deg)", "Normal Mean Angle"),
+        "pose_rot_deg": ("Pose Rotation Error (deg)", "Pose Rotation Error"),
+    }
+    for key, (ylabel, title) in metric_keys.items():
+        vals = [h.get(key) for h in history]
+        if vals[0] is None:
+            continue
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(epochs, vals, marker="o", markersize=3)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plots_dir / f"{key}.png", dpi=150)
+        plt.close(fig)
 
 
 def main():
@@ -255,7 +336,7 @@ def main():
     task = cfg["model"]["task"]
 
     if is_distributed():
-        model = DDP(model, device_ids=[device.index], static_graph=True)
+        model = DDP(model, device_ids=[device.index], find_unused_parameters=True)
 
     criterion = build_multitask_criterion(cfg)
     if criterion is not None:
@@ -287,8 +368,10 @@ def main():
     if is_main_process():
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    md_cfg = cfg.get("modality_dropout", {})
     best_depth = float("inf")
     best_pose = float("inf")
+    history: list[dict] = []
     for epoch in range(train_cfg["epochs"]):
         if is_distributed():
             train_loader.sampler.set_epoch(epoch)
@@ -305,12 +388,13 @@ def main():
             epoch=epoch,
             criterion=criterion,
             scheduler=scheduler,
+            md_cfg=md_cfg,
         )
 
         if is_main_process():
-            val_metrics = evaluate(model, val_loader, device, task, target_std=target_std, criterion=criterion)
+            val_result = evaluate(model, val_loader, device, task, target_std=target_std, criterion=criterion)
             train_loss = train_metrics.get("total", train_metrics.get("loss", 0.0))
-            print(f"epoch={epoch:03d} train_loss={train_loss:.4f} val={val_metrics}")
+            print(f"epoch={epoch:03d} train_loss={train_loss:.4f} val={val_result}")
 
             def _save_ckpt(path):
                 trainable_state = {
@@ -331,8 +415,9 @@ def main():
                 torch.save(save_obj, path)
 
             if task == "reconstruction":
-                depth_score = val_metrics.get("depth_mse", float("inf"))
-                pose_score = val_metrics.get("pose_rot_deg", float("inf"))
+                both_metrics = val_result.get("both", val_result)
+                depth_score = both_metrics.get("depth_mse", float("inf"))
+                pose_score = both_metrics.get("pose_rot_deg", float("inf"))
                 if depth_score < best_depth:
                     best_depth = depth_score
                     _save_ckpt(output_dir / "best_depth.pt")
@@ -342,11 +427,31 @@ def main():
                     _save_ckpt(output_dir / "best_pose.pt")
                     print(f"  ** new best pose: rot_deg={best_pose:.3f}")
             else:
-                val_loss = val_metrics["loss"]
+                val_loss = val_result["loss"]
                 if val_loss < best_depth:
                     best_depth = val_loss
                     _save_ckpt(output_dir / "best.pt")
                     print(f"saved best checkpoint to {output_dir / 'best.pt'}")
+
+            # --- Record history and plot ---
+            record = {
+                "epoch": epoch,
+                "train_loss": round(train_loss, 6),
+                "val": val_result,
+            }
+            if task == "reconstruction" and isinstance(val_result, dict) and "both" in val_result:
+                both_m = val_result["both"]
+                record["val_loss"] = round(both_m.get("loss", 0), 6)
+                for k in ("depth_mse", "normal_mean_angle", "pose_rot_deg"):
+                    if k in both_m:
+                        record[k] = both_m[k]
+            history.append(record)
+            with open(output_dir / "history.json", "w") as f:
+                json.dump(history, f, indent=2)
+            try:
+                plot_curves(history, output_dir)
+            except Exception as e:
+                print(f"  [WARN] plot_curves failed: {e}")
 
         if is_distributed():
             dist.barrier()

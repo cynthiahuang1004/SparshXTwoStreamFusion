@@ -48,7 +48,7 @@ class DINOv3Encoder(nn.Module):
     [CLS, register x R, patch x N]; we expose patch tokens and CLS. All params frozen.
     """
 
-    def __init__(self, weights, image_size=224):
+    def __init__(self, weights, image_size=224, multiscale_layers=None):
         super().__init__()
         if weights is None:
             raise ValueError(
@@ -70,6 +70,11 @@ class DINOv3Encoder(nn.Module):
         self.num_register = cfg.num_register_tokens
         self._patch_start = 1 + self.num_register               # skip CLS + registers
         self.num_patches = (image_size // cfg.patch_size) ** 2
+        if multiscale_layers is None:
+            num_layers = cfg.num_hidden_layers
+            multiscale_layers = [num_layers // 4 - 1, num_layers // 2 - 1,
+                                 3 * num_layers // 4 - 1, num_layers - 1]
+        self.multiscale_layers = sorted(multiscale_layers)
 
         for p in self.dinov3.parameters():
             p.requires_grad = False
@@ -87,6 +92,11 @@ class DINOv3Encoder(nn.Module):
         cls = tokens[:, :1]                                # [B, 1, E]
         return patch, cls
 
+    @torch.no_grad()
+    def forward_multiscale(self, x):
+        hs = self.dinov3(x, output_hidden_states=True).hidden_states
+        return [hs[i + 1][:, self._patch_start:] for i in self.multiscale_layers]
+
 
 class MockEncoder(nn.Module):
     """Deterministic frozen stand-in for DINOv3 with identical output shapes.
@@ -94,15 +104,19 @@ class MockEncoder(nn.Module):
     Patch-embed conv -> N tokens; CLS = linear(mean of tokens). All params frozen.
     """
 
-    def __init__(self, embed_dim=1024, patch_size=16, image_size=224):
+    def __init__(self, embed_dim=1024, patch_size=16, image_size=224, multiscale_k=4):
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.grid = image_size // patch_size
         self.num_patches = self.grid * self.grid
+        self.multiscale_layers = list(range(multiscale_k))
 
         self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.cls_proj = nn.Linear(embed_dim, embed_dim)
+        self.scale_projs = nn.ModuleList(
+            [nn.Linear(embed_dim, embed_dim) for _ in range(multiscale_k)]
+        )
         for p in self.parameters():
             p.requires_grad = False
 
@@ -116,13 +130,20 @@ class MockEncoder(nn.Module):
         cls = self.cls_proj(patch.mean(dim=1, keepdim=True))   # [B, 1, E]
         return patch, cls
 
+    @torch.no_grad()
+    def forward_multiscale(self, x):
+        patch = self._tokens(x)
+        return [proj(patch) for proj in self.scale_projs]
+
 
 def build_encoder(enc_cfg, image_size):
     """Factory: real DINOv3 if a checkpoint is set, else the MockEncoder for testing."""
     enc_cfg = enc_cfg or {}
     checkpoint = enc_cfg.get("checkpoint", None)
+    multiscale = enc_cfg.get("multiscale_layers", None)
     if checkpoint:
-        return DINOv3Encoder(weights=checkpoint, image_size=image_size)
+        return DINOv3Encoder(weights=checkpoint, image_size=image_size,
+                             multiscale_layers=multiscale)
     return MockEncoder(
         embed_dim=enc_cfg.get("embed_dim", 1024),
         patch_size=enc_cfg.get("patch_size", 16),

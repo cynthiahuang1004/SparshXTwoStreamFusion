@@ -14,6 +14,7 @@ data:
     tactile_dir: samples
     raw_dir: raw_data
     use_gt_depth: true
+    use_rendered_normals: true
     depth_scale: 1000.0
     val_every: 20
     augment: true
@@ -42,6 +43,7 @@ model:
     embed_dim: 1024
     patch_size: 16
     share_encoder_weights: true
+    multiscale_layers: [5, 11, 17, 23]
   dpt:
     features: 256
     dropout: 0.1
@@ -70,6 +72,12 @@ loss:
   uncertainty_weighting: true
   grouped_uncertainty: true
   dense_pose_ratio: 1.0
+
+modality_dropout:
+  enabled: true
+  p_both: 0.55
+  p_tactile_only: 0.35
+  p_rgb_only: 0.10
 
 train:
   epochs: 150

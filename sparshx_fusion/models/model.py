@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +9,8 @@ import torch.nn as nn
 from .encoders import build_encoder
 from .heads import DPTHead, PoseHead
 from .layers import MLPHead, SharedBottleneckFusionLayer, TransformerBlock, init_vit_weights
+
+VALID_CONFIGS = ("both", "tactile", "rgb")
 
 
 @dataclass
@@ -23,35 +26,15 @@ class ModelOutput:
     se2: torch.Tensor | None = None
 
 
-def _tap_indices(num_layers: int, k: int = 4) -> list[int]:
-    """k evenly-spaced layer indices (shallow->deep) ending at the last layer.
-
-    Used to pick exactly `k` DPT taps from the tactile-stream snapshots collected across
-    the fusion blocks, regardless of how many fusion layers the model has.
-    """
-    if num_layers <= 0:
-        return [0] * k
-    if num_layers <= k:
-        # repeat the last available snapshot to reach k taps
-        return list(range(num_layers)) + [num_layers - 1] * (k - num_layers)
-    step = num_layers / k
-    idx = sorted({min(num_layers - 1, int(round((i + 1) * step)) - 1) for i in range(k)})
-    while len(idx) < k:
-        for cand in range(num_layers - 1, -1, -1):
-            if cand not in idx:
-                idx.append(cand)
-                break
-        idx = sorted(set(idx))
-    return idx[-k:]
-
-
 class SparshXTwoStreamFusionModel(nn.Module):
     """Two-stream visuo-tactile transformer with symmetric shared bottleneck fusion.
 
-    Tokens come from a *frozen* DINO encoder (shared across modalities by default), same method
-    as VisTacFusion: each image -> patch tokens at the encoder's native dim E, then projected to
-    the trainable fusion dim `embed_dim`. Only the projections, modality/pos embeddings, the
-    independent refinement blocks, the fusion blocks, and the head are trainable.
+    Architecture (v2 — DPT decoupled from fusion trunk):
+      - Frozen DINOv3 encoder (shared) produces patch tokens + multiscale taps
+      - Patch tokens projected E→D, refined by independent blocks, then fused
+      - DPT path: encoder multiscale taps @ E dim (decoupled from fusion)
+      - Pose path: mean-pooled post-fusion tactile tokens + spatial pool @ D dim
+      - Modality dropout: train with both/tactile/rgb configs; eval per-config
     """
 
     def __init__(
@@ -100,15 +83,19 @@ class SparshXTwoStreamFusionModel(nn.Module):
         enc_dim = self.tactile_encoder.embed_dim
         num_patches = self.tactile_encoder.num_patches
 
-        # ---- Projections (E -> D), LayerNorm stabilizes frozen-feature scale ----
-        self.rgb_proj = nn.Sequential(nn.LayerNorm(enc_dim), nn.Linear(enc_dim, embed_dim))
-        self.tactile_proj = nn.Sequential(nn.LayerNorm(enc_dim), nn.Linear(enc_dim, embed_dim))
+        # ---- Projections (E -> D) ----
+        self.rgb_proj = nn.Linear(enc_dim, embed_dim)
+        self.tactile_proj = nn.Linear(enc_dim, embed_dim)
 
         self.rgb_pos = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
         self.tactile_pos = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
         self.rgb_modality = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.tactile_modality = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.bottleneck = nn.Parameter(torch.zeros(1, num_bottleneck_tokens, embed_dim))
+
+        # Learnable mask tokens for modality dropout
+        self.rgb_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.tactile_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
         self.rgb_blocks = nn.ModuleList(
             [TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(independent_layers)]
@@ -133,19 +120,23 @@ class SparshXTwoStreamFusionModel(nn.Module):
             else None
         )
 
-        # ---- Dense DPT decoder for the 3D reconstruction task ----
-        # Taps are the tactile-stream tokens snapshotted after each fusion block (4 evenly
-        # spaced ones feed the DPT), so depth is reconstructed in the tactile (contact) frame.
+        # ---- Dense DPT decoder: uses encoder multiscale taps @ enc_dim ----
         dpt_cfg = dict(dpt or {})
         pose_cfg = dict(pose or {})
         self.dpt = (
             DPTHead(
-                embed_dim=embed_dim,
+                embed_dim=enc_dim,
                 features=dpt_cfg.get("features", 256),
                 dropout=dpt_cfg.get("dropout", 0.0),
                 out_depth_channels=dpt_cfg.get("out_depth_channels", 1),
                 out_normal_channels=dpt_cfg.get("out_normal_channels", 3),
             )
+            if task == "reconstruction"
+            else None
+        )
+        # Spatial pos embedding for DPT taps (at encoder dim)
+        self.dpt_pos = (
+            nn.Parameter(torch.zeros(1, num_patches, enc_dim))
             if task == "reconstruction"
             else None
         )
@@ -180,50 +171,68 @@ class SparshXTwoStreamFusionModel(nn.Module):
         nn.init.trunc_normal_(self.rgb_modality, std=0.02)
         nn.init.trunc_normal_(self.tactile_modality, std=0.02)
         nn.init.trunc_normal_(self.bottleneck, std=0.02)
+        nn.init.trunc_normal_(self.rgb_mask_token, std=0.02)
+        nn.init.trunc_normal_(self.tactile_mask_token, std=0.02)
+        if self.dpt_pos is not None:
+            nn.init.trunc_normal_(self.dpt_pos, std=0.02)
 
-    def encode_tokens(
-        self, rgb: torch.Tensor, tactile: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
-        rgb_patch, _ = self.rgb_encoder(rgb)              # [B, N, E] (frozen)
-        tactile_patch, _ = self.tactile_encoder(tactile)  # [B, N, E] (frozen)
+    def forward(self, rgb: torch.Tensor, tactile: torch.Tensor,
+                config: str = "both") -> ModelOutput:
+        if config not in VALID_CONFIGS:
+            raise ValueError(f"config must be one of {VALID_CONFIGS}, got {config!r}")
+        use_rgb = config in ("both", "rgb")
+        use_tactile = config in ("both", "tactile")
 
-        rgb_tokens = self.rgb_proj(rgb_patch) + self.rgb_pos + self.rgb_modality
-        tactile_tokens = self.tactile_proj(tactile_patch) + self.tactile_pos + self.tactile_modality
+        B = rgb.shape[0]
 
+        # ---- Encode (frozen) ----
+        if use_rgb:
+            rgb_patch, _ = self.rgb_encoder(rgb)
+        if use_tactile:
+            tactile_patch, _ = self.tactile_encoder(tactile)
+
+        # ---- Project to fusion dim, add pos + modality embeddings ----
+        if use_rgb:
+            rgb_tokens = self.rgb_proj(rgb_patch) + self.rgb_pos + self.rgb_modality
+        else:
+            rgb_tokens = self.rgb_mask_token.expand(B, self.rgb_pos.shape[1], -1) + self.rgb_pos + self.rgb_modality
+
+        if use_tactile:
+            tactile_tokens = self.tactile_proj(tactile_patch) + self.tactile_pos + self.tactile_modality
+        else:
+            tactile_tokens = self.tactile_mask_token.expand(B, self.tactile_pos.shape[1], -1) + self.tactile_pos + self.tactile_modality
+
+        # ---- Independent pre-fusion refinement ----
         for rgb_block, tactile_block in zip(self.rgb_blocks, self.tactile_blocks):
             rgb_tokens = rgb_block(rgb_tokens)
             tactile_tokens = tactile_block(tactile_tokens)
 
-        bottleneck = self.bottleneck.expand(rgb.shape[0], -1, -1)
-        # Snapshot the tactile stream after each fusion block; these are the DPT taps.
-        tactile_taps: list[torch.Tensor] = []
+        # ---- Shared bottleneck fusion ----
+        bottleneck = self.bottleneck.expand(B, -1, -1)
         for fusion_block in self.fusion_blocks:
             rgb_tokens, tactile_tokens, bottleneck = fusion_block(rgb_tokens, tactile_tokens, bottleneck)
-            tactile_taps.append(tactile_tokens)
 
-        return rgb_tokens, tactile_tokens, bottleneck, tactile_taps
-
-    def decode_depth(self, tactile_taps: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:
-        idx = _tap_indices(len(tactile_taps), k=4)
-        taps = [tactile_taps[i] for i in idx]
-        return self.dpt(taps, out_hw=(self.image_size, self.image_size))
-
-    def pool(self, rgb_tokens: torch.Tensor, tactile_tokens: torch.Tensor, bottleneck: torch.Tensor) -> torch.Tensor:
-        rgb_feat = rgb_tokens.mean(dim=1)
-        tactile_feat = tactile_tokens.mean(dim=1)
-        bottleneck_feat = bottleneck.mean(dim=1)
-        fused = torch.cat([rgb_feat, tactile_feat, bottleneck_feat], dim=-1)
-        return self.norm(fused) if self.norm is not None else fused
-
-    def forward(self, rgb: torch.Tensor, tactile: torch.Tensor) -> ModelOutput:
-        rgb_tokens, tactile_tokens, bottleneck, tactile_taps = self.encode_tokens(rgb, tactile)
-
+        # ---- DPT path: encoder multiscale taps (decoupled from fusion trunk) ----
         depth = normal = se2 = None
         if self.dpt is not None:
-            depth, normal = self.decode_depth(tactile_taps)
+            if use_tactile:
+                dpt_taps = self.tactile_encoder.forward_multiscale(tactile)
+            else:
+                dpt_taps = self.rgb_encoder.forward_multiscale(rgb)
+            dpt_taps = [t + self.dpt_pos for t in dpt_taps]
+            depth, normal = self.dpt(dpt_taps, out_hw=(self.image_size, self.image_size))
+
+        # ---- Pose path: from post-fusion tokens ----
         if self.pose_head is not None:
-            pose_token = tactile_tokens.mean(dim=1, keepdim=True)
-            se2 = self.pose_head(pose_token, spatial_queries=tactile_tokens)["se2"]
+            if use_tactile:
+                pose_token = tactile_tokens.mean(dim=1, keepdim=True)
+                spatial_queries = tactile_tokens
+            else:
+                pose_token = rgb_tokens.mean(dim=1, keepdim=True)
+                spatial_queries = rgb_tokens
+            # Concatenate bottleneck info for richer pose signal
+            pose_token = pose_token + bottleneck.mean(dim=1, keepdim=True)
+            se2 = self.pose_head(pose_token, spatial_queries=spatial_queries)["se2"]
 
         # The pooled global embedding / classifier / regressor are not used by the dense
         # reconstruction head, so skip them (and their cost) for that task.
@@ -244,3 +253,10 @@ class SparshXTwoStreamFusionModel(nn.Module):
             normal=normal,
             se2=se2,
         )
+
+    def pool(self, rgb_tokens: torch.Tensor, tactile_tokens: torch.Tensor, bottleneck: torch.Tensor) -> torch.Tensor:
+        rgb_feat = rgb_tokens.mean(dim=1)
+        tactile_feat = tactile_tokens.mean(dim=1)
+        bottleneck_feat = bottleneck.mean(dim=1)
+        fused = torch.cat([rgb_feat, tactile_feat, bottleneck_feat], dim=-1)
+        return self.norm(fused) if self.norm is not None else fused

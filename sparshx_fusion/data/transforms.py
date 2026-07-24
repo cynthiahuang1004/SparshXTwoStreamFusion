@@ -44,8 +44,8 @@ def fixed_center_crop(img, out_size=None):
     return cv2.resize(crop, out, interpolation=cv2.INTER_LINEAR)
 
 
-def rotate_gel_spin(tactile, rgb, depth, angle_deg):
-    """Rotate tactile + rgb + depth by angle_deg around the image center.
+def rotate_gel_spin(tactile, rgb, depth, angle_deg, normal=None):
+    """Rotate tactile + rgb + depth (+ optional normal) by angle_deg around the image center.
 
     Simulates spinning the gel in place: image content rotates, theta changes
     by -angle_deg, (x, y) unchanged.
@@ -56,6 +56,9 @@ def rotate_gel_spin(tactile, rgb, depth, angle_deg):
     tac = cv2.warpAffine(tactile, M, (W, H), flags=flags, borderMode=border)
     rgb_r = cv2.warpAffine(rgb, M, (W, H), flags=flags, borderMode=border)
     dep = cv2.warpAffine(depth, M, (W, H), flags=flags, borderMode=border)
+    if normal is not None:
+        nrm = cv2.warpAffine(normal, M, (W, H), flags=flags, borderMode=border)
+        return tac, rgb_r, dep, nrm
     return tac, rgb_r, dep
 
 

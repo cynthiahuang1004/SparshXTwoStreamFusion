@@ -349,6 +349,8 @@ class GsBlenderDepthDataset(Dataset):
         rot_augment: bool = True,
         rot_augment_max_deg: float = 180.0,
         gel_view_m: float = 0.017502,
+        use_rendered_normals: bool = False,
+        use_gt_depth: bool = True,
     ):
         root = Path(root)
         self.image_size = image_size
@@ -359,6 +361,8 @@ class GsBlenderDepthDataset(Dataset):
         self.rot_aug = augment and rot_augment
         self.rot_aug_max_deg = rot_augment_max_deg
         self.pixel_size = gel_view_m * FIXED_CROP / image_size
+        self.use_rendered_normals = use_rendered_normals
+        self.use_gt_depth = use_gt_depth
 
         mesh_dir = Path(mesh_dir) if mesh_dir else root.parent / "meshes"
         obj_pose_info = load_object_pose_info(root, mesh_dir)
@@ -407,21 +411,37 @@ class GsBlenderDepthDataset(Dataset):
         depth_raw = self._load_depth_raw(s["depth"])
         pose = self._load_pose_se2(s["pose"], s["unit"])
 
+        normal = None
+        if self.use_rendered_normals:
+            stem = Path(s["depth"]).stem.split("_")[0]
+            norm_suffix = "_gt" if self.use_gt_depth else ""
+            norm_path = Path(s["unit"]) / "norms" / f"{stem}{norm_suffix}.png"
+            if norm_path.exists():
+                normal = np.array(Image.open(norm_path), dtype=np.float32)
+
         if self.rot_aug:
             phi_deg = random.uniform(-self.rot_aug_max_deg, self.rot_aug_max_deg)
-            tactile, rgb, depth_raw = rotate_gel_spin(tactile, rgb, depth_raw, phi_deg)
+            if normal is not None:
+                tactile, rgb, depth_raw, normal = rotate_gel_spin(tactile, rgb, depth_raw, phi_deg, normal=normal)
+            else:
+                tactile, rgb, depth_raw = rotate_gel_spin(tactile, rgb, depth_raw, phi_deg)
             pose = rotate_pose_theta(pose, -math.radians(phi_deg))
 
         tactile = fixed_center_crop(tactile)
         rgb = fixed_center_crop(rgb)
         depth_raw = fixed_center_crop(depth_raw)
+        if normal is not None:
+            normal = fixed_center_crop(normal)
 
         if self.tactile_aug is not None:
             tactile = self.tactile_aug(tactile)
         if self.rgb_aug is not None:
             rgb = self.rgb_aug(rgb)
 
-        normal = self.depth_to_normal(depth_raw, self.pixel_size, self.pixel_size)
+        if normal is not None:
+            normal = normal / 127.5 - 1.0
+        else:
+            normal = self.depth_to_normal(depth_raw, self.pixel_size, self.pixel_size)
         mask = (depth_raw > 0).astype(np.float32)
         depth = depth_raw * self.depth_scale
         out_hw = (self.image_size, self.image_size)
@@ -474,6 +494,8 @@ def _build_gs_blender_recon(cfg: Any, image_size: int):
     rot_augment = gb.get("rot_augment", True)
     rot_augment_max_deg = gb.get("rot_augment_max_deg", 180.0)
     gel_view_m = gb.get("gel_view_m", 0.017502)
+    use_rendered_normals = gb.get("use_rendered_normals", False)
+    use_gt_depth = gb.get("use_gt_depth", True)
     train_ds = GsBlenderDepthDataset(
         train_samples,
         root=gb["root"],
@@ -485,6 +507,8 @@ def _build_gs_blender_recon(cfg: Any, image_size: int):
         rot_augment=rot_augment,
         rot_augment_max_deg=rot_augment_max_deg,
         gel_view_m=gel_view_m,
+        use_rendered_normals=use_rendered_normals,
+        use_gt_depth=use_gt_depth,
     )
     val_ds = GsBlenderDepthDataset(
         val_samples,
@@ -494,6 +518,8 @@ def _build_gs_blender_recon(cfg: Any, image_size: int):
         mesh_dir=mesh_dir,
         augment=False,
         gel_view_m=gel_view_m,
+        use_rendered_normals=use_rendered_normals,
+        use_gt_depth=use_gt_depth,
     )
     print(
         f"gs_blender(recon) augment(train)={augment} depth_scale={depth_scale} "
