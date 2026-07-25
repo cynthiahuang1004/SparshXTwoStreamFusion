@@ -262,7 +262,7 @@ def evaluate(model, loader, device, task: str, target_std=None, criterion=None):
 
 
 def plot_curves(history: list[dict], output_dir: Path) -> None:
-    """Save loss-curve PNGs from accumulated epoch history."""
+    """Save loss-curve PNGs from accumulated epoch history, per-config."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -273,10 +273,21 @@ def plot_curves(history: list[dict], output_dir: Path) -> None:
 
     # --- 1. Combined train/val loss ---
     train_loss = [h["train_loss"] for h in history]
-    val_loss = [h["val_loss"] for h in history]
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(epochs, train_loss, label="train loss")
-    ax.plot(epochs, val_loss, label="val loss")
+    configs = ("both", "tactile", "rgb")
+    for cfg_name in configs:
+        vals = []
+        for h in history:
+            v = h.get("val", {})
+            if isinstance(v, dict) and cfg_name in v:
+                vals.append(v[cfg_name].get("loss", None))
+            elif cfg_name == "both":
+                vals.append(h.get("val_loss"))
+            else:
+                vals.append(None)
+        if vals[0] is not None:
+            ax.plot(epochs, vals, label=f"val loss ({cfg_name})")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title("Train / Val Loss")
@@ -286,21 +297,35 @@ def plot_curves(history: list[dict], output_dir: Path) -> None:
     fig.savefig(plots_dir / "loss_curves.png", dpi=150)
     plt.close(fig)
 
-    # --- 2. Individual metric plots (reconstruction only) ---
+    # --- 2. Per-config metric plots (reconstruction only) ---
     metric_keys = {
         "depth_mse": ("Depth MSE", "Depth MSE"),
         "normal_mean_angle": ("Normal Mean Angle (deg)", "Normal Mean Angle"),
         "pose_rot_deg": ("Pose Rotation Error (deg)", "Pose Rotation Error"),
     }
     for key, (ylabel, title) in metric_keys.items():
-        vals = [h.get(key) for h in history]
-        if vals[0] is None:
-            continue
         fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(epochs, vals, marker="o", markersize=3)
+        has_data = False
+        for cfg_name in configs:
+            vals = []
+            for h in history:
+                v = h.get("val", {})
+                if isinstance(v, dict) and cfg_name in v:
+                    vals.append(v[cfg_name].get(key))
+                elif cfg_name == "both":
+                    vals.append(h.get(key))
+                else:
+                    vals.append(None)
+            if vals[0] is not None:
+                ax.plot(epochs, vals, marker="o", markersize=2, label=cfg_name)
+                has_data = True
+        if not has_data:
+            plt.close(fig)
+            continue
         ax.set_xlabel("Epoch")
         ax.set_ylabel(ylabel)
         ax.set_title(title)
+        ax.legend()
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(plots_dir / f"{key}.png", dpi=150)

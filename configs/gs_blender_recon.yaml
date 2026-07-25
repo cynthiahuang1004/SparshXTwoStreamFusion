@@ -27,12 +27,12 @@ model:
   patch_size: 16
   in_chans: 3
   embed_dim: 768
-  depth: 8
+  depth: 12
   num_heads: 8
   mlp_ratio: 4
-  independent_layers: 4
+  independent_layers: 8
   fusion_layers: 4
-  num_bottleneck_tokens: 16
+  num_bottleneck_tokens: 4
   dropout: 0.1
   task: reconstruction
   num_classes: 4
