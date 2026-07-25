@@ -348,6 +348,7 @@ def main():
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
 
     ddp_device, rank, world_size = setup_distributed()
@@ -404,11 +405,30 @@ def main():
     if is_main_process():
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    md_cfg = cfg.get("modality_dropout", {})
+    # ---- Resume from checkpoint ----
+    start_epoch = 0
     best_depth = float("inf")
     best_pose = float("inf")
     history: list[dict] = []
-    for epoch in range(train_cfg["epochs"]):
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        raw_model.load_state_dict(ckpt["model"], strict=False)
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        if criterion is not None and "criterion" in ckpt:
+            criterion.load_state_dict(ckpt["criterion"])
+        start_epoch = ckpt["epoch"] + 1
+        history_path = output_dir / "history.json"
+        if history_path.exists():
+            with open(history_path) as f:
+                history = json.load(f)
+            history = [h for h in history if h["epoch"] < start_epoch]
+        if is_main_process():
+            print(f"Resumed from {args.resume}, starting at epoch {start_epoch} (history: {len(history)} entries)")
+
+    md_cfg = cfg.get("modality_dropout", {})
+    for epoch in range(start_epoch, train_cfg["epochs"]):
         if is_distributed():
             train_loader.sampler.set_epoch(epoch)
 
