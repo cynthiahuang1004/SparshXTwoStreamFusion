@@ -77,7 +77,7 @@ modality_dropout:
 
 train:
   epochs: 150
-  batch_size: 64
+  batch_size: 32
   num_workers: 8
   lr: 0.0002
   weight_decay: 0.05

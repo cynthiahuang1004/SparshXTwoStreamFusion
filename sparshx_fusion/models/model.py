@@ -228,9 +228,8 @@ class SparshXTwoStreamFusionModel(nn.Module):
             use_spatial_pool=pose_cfg.get("use_spatial_pool", True),
         )
 
-        # ---- Initialize trainable modules ----
-        for m in [self.tactile_proj, self.rgb_proj, self.spatial_pos, self.dpt_pos,
-                  self.trunk, self.tap_inject, self.dpt, self.pose_head]:
+        # ---- Initialize trainable modules (match VisTacFusion: only trunk + projections) ----
+        for m in [self.tactile_proj, self.rgb_proj, self.trunk]:
             m.apply(init_vit_weights)
 
     def _build_pose_memory(self, rgb_patch, rgb_cls):
