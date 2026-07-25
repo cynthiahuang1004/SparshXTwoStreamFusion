@@ -1,6 +1,20 @@
+"""MBT fusion ablation baseline — identical to VisTacFusion except the fusion trunk.
+
+Dense (DPT) and Pose paths are decoupled (same as VisTacFusion v3):
+
+  DPT path:  encoder multiscale taps at native dim (1024) → RGB injection via bottleneck
+             → DPT Reassemble(1024→256) → depth/normal.
+
+  Pose path: encoder → Projection(1024→768) → MBT Fusion Trunk(768) → Pose Head.
+             Modality dropout (both/tactile/rgb) only affects this path.
+
+The ONLY difference from VisTacFusion:
+  - Fusion trunk uses symmetric shared-bottleneck (MBT) instead of asymmetric cross-attention.
+  - MBT: both streams self-attend with shared bottleneck tokens, then bottleneck is averaged.
+  - VisTacFusion: bottleneck cross-attends to RGB memory, then queries cross-attend to bottleneck.
+"""
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass
 
 import torch
@@ -8,255 +22,267 @@ import torch.nn as nn
 
 from .encoders import build_encoder
 from .heads import DPTHead, PoseHead
-from .layers import MLPHead, SharedBottleneckFusionLayer, TransformerBlock, init_vit_weights
+from .layers import SharedBottleneckFusionLayer, init_vit_weights
 
 VALID_CONFIGS = ("both", "tactile", "rgb")
 
 
 @dataclass
 class ModelOutput:
-    rgb_tokens: torch.Tensor
-    tactile_tokens: torch.Tensor
-    bottleneck_tokens: torch.Tensor
-    fused_embedding: torch.Tensor | None = None
-    logits: torch.Tensor | None = None
-    regression: torch.Tensor | None = None
     depth: torch.Tensor | None = None
     normal: torch.Tensor | None = None
     se2: torch.Tensor | None = None
 
 
-class SparshXTwoStreamFusionModel(nn.Module):
-    """Two-stream visuo-tactile transformer with symmetric shared bottleneck fusion.
+class BranchProjection(nn.Module):
+    def __init__(self, in_dim=1024, out_dim=768):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim)
+        self.modality_emb = nn.Parameter(torch.zeros(1, 1, out_dim))
+        nn.init.normal_(self.modality_emb, std=0.02)
 
-    Architecture (v2 — DPT decoupled from fusion trunk):
-      - Frozen DINOv3 encoder (shared) produces patch tokens + multiscale taps
-      - Patch tokens projected E→D, refined by independent blocks, then fused
-      - DPT path: encoder multiscale taps @ E dim (decoupled from fusion)
-      - Pose path: mean-pooled post-fusion tactile tokens + spatial pool @ D dim
-      - Modality dropout: train with both/tactile/rgb configs; eval per-config
+    def forward(self, tokens):
+        return self.proj(tokens) + self.modality_emb
+
+
+class SpatialPosEmbedding(nn.Module):
+    def __init__(self, num_tokens=196, dim=768):
+        super().__init__()
+        self.pos = nn.Parameter(torch.zeros(1, num_tokens, dim))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+
+    def forward(self, x):
+        return x + self.pos
+
+
+class TapInjection(nn.Module):
+    """Per-tap residual RGB injection: tap += gate * CrossAttn(Q=tap, K=V=bottleneck).
+
+    Identical to VisTacFusion's TapInjection.
+    Q is at encoder dim (e.g. 1024), KV at trunk dim (e.g. 768).
+    ReZero gate init 0 → starts as pure encoder taps, learns to inject.
+    """
+
+    def __init__(self, q_dim, kv_dim, num_heads, dropout=0.0, gate_init=0.0):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(q_dim)
+        self.norm_kv = nn.LayerNorm(kv_dim)
+        self.q_proj = nn.Linear(q_dim, q_dim)
+        self.k_proj = nn.Linear(kv_dim, q_dim)
+        self.v_proj = nn.Linear(kv_dim, q_dim)
+        self.out_proj = nn.Linear(q_dim, q_dim)
+        self.num_heads = num_heads
+        self.head_dim = q_dim // num_heads
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, tap, bottleneck):
+        B, N, _ = tap.shape
+        q = self.q_proj(self.norm_q(tap))
+        kv_normed = self.norm_kv(bottleneck)
+        k = self.k_proj(kv_normed)
+        v = self.v_proj(kv_normed)
+
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        attn = attn.transpose(1, 2).reshape(B, N, -1)
+        return tap + self.gate * self.out_proj(attn)
+
+
+class MBTFusionTrunk(nn.Module):
+    """Symmetric shared-bottleneck (MBT) fusion trunk.
+
+    Same interface as VisTacFusion's FusionTrunk:
+      forward(queries, memory, use_rgb) -> (taps, pose_token, bottleneck)
+
+    Instead of asymmetric cross-attention, uses shared bottleneck:
+      1. Prepend bottleneck to both query and memory streams
+      2. Self-attend within each stream
+      3. Average bottleneck from both streams
+    """
+
+    def __init__(self, num_layers=4, dim=768, num_heads=8, num_bottleneck_tokens=4,
+                 mlp_ratio=4, dropout=0.1, tap_layers=None):
+        super().__init__()
+        self.num_layers = num_layers
+        self.dim = dim
+        self.num_bottleneck = num_bottleneck_tokens
+        self.tap_layers = tap_layers or list(range(num_layers))
+        assert len(self.tap_layers) == 4, "DPT needs exactly 4 taps."
+
+        self.bottleneck = nn.Parameter(torch.zeros(1, num_bottleneck_tokens, dim))
+        nn.init.trunc_normal_(self.bottleneck, std=0.02)
+
+        self.layers = nn.ModuleList([
+            SharedBottleneckFusionLayer(dim, num_heads, mlp_ratio, dropout)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, queries, memory, use_rgb):
+        B = queries.shape[0]
+        bottleneck = self.bottleneck.expand(B, -1, -1)
+
+        if not use_rgb:
+            memory = torch.zeros(B, queries.shape[1], self.dim,
+                                 device=queries.device, dtype=queries.dtype)
+
+        taps = []
+        for i, layer in enumerate(self.layers):
+            queries, memory, bottleneck = layer(queries, memory, bottleneck)
+            if i in self.tap_layers:
+                taps.append(queries[:, :-1])
+
+        pose_token = queries[:, -1:]
+        return taps, pose_token, bottleneck
+
+
+class SparshXTwoStreamFusionModel(nn.Module):
+    """MBT fusion ablation — VisTacFusion with symmetric shared-bottleneck trunk.
+
+    Everything except the fusion trunk is identical to VisTacFusion.
     """
 
     def __init__(
         self,
         image_size: int = 224,
-        patch_size: int = 16,
-        in_chans: int = 3,
-        embed_dim: int = 192,
-        depth: int = 8,
-        num_heads: int = 3,
-        mlp_ratio: float = 4.0,
-        independent_layers: int = 4,
-        fusion_layers: int = 4,
-        num_bottleneck_tokens: int = 8,
-        dropout: float = 0.0,
-        task: str = "classification",
-        num_classes: int = 4,
-        regression_dim: int = 3,
-        head_hidden_dim: int | None = None,
-        head_layers: int = 2,
-        head_dropout: float = 0.1,
+        trunk_dim: int = 768,
         encoder: dict | None = None,
+        fusion_trunk: dict | None = None,
         dpt: dict | None = None,
         pose: dict | None = None,
+        inject_gate_init: float = 0.0,
+        **kwargs,
     ):
         super().__init__()
-        if independent_layers + fusion_layers != depth:
-            raise ValueError("independent_layers + fusion_layers must equal depth")
-        if task not in {"classification", "regression", "embedding", "reconstruction"}:
-            raise ValueError(
-                "task must be one of: classification, regression, embedding, reconstruction"
-            )
-
-        self.task = task
         self.image_size = image_size
-        self.embed_dim = embed_dim
-        self.num_bottleneck_tokens = num_bottleneck_tokens
+        self.trunk_dim = trunk_dim
 
-        # ---- Frozen DINO encoders (shared or two instances) ----
+        # ---- Encoder (frozen) ----
         enc_cfg = dict(encoder or {})
+        multiscale_layers = enc_cfg.pop("multiscale_layers", [5, 11, 17, 23])
+        enc_cfg["multiscale_layers"] = multiscale_layers
         self.tactile_encoder = build_encoder(enc_cfg, image_size)
         if enc_cfg.get("share_encoder_weights", True):
             self.rgb_encoder = self.tactile_encoder
         else:
             self.rgb_encoder = build_encoder(enc_cfg, image_size)
-        enc_dim = self.tactile_encoder.embed_dim
-        num_patches = self.tactile_encoder.num_patches
+        self.enc_dim = self.tactile_encoder.embed_dim
+        self.num_spatial = self.tactile_encoder.num_patches
 
-        # ---- Projections (E -> D) ----
-        self.rgb_proj = nn.Linear(enc_dim, embed_dim)
-        self.tactile_proj = nn.Linear(enc_dim, embed_dim)
+        # ---- Pose path: projection (enc_dim→trunk_dim) ----
+        self.tactile_proj = BranchProjection(self.enc_dim, trunk_dim)
+        self.rgb_proj = BranchProjection(self.enc_dim, trunk_dim)
+        self.spatial_pos = SpatialPosEmbedding(self.num_spatial, trunk_dim)
 
-        self.rgb_pos = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-        self.tactile_pos = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-        self.rgb_modality = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.tactile_modality = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.bottleneck = nn.Parameter(torch.zeros(1, num_bottleneck_tokens, embed_dim))
+        self.spatial_mask = nn.Parameter(torch.zeros(1, self.num_spatial, trunk_dim))
+        self.pose_mask = nn.Parameter(torch.zeros(1, 1, trunk_dim))
+        nn.init.trunc_normal_(self.spatial_mask, std=0.02)
+        nn.init.trunc_normal_(self.pose_mask, std=0.02)
 
-        # Learnable mask tokens for modality dropout
-        self.rgb_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.tactile_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-
-        self.rgb_blocks = nn.ModuleList(
-            [TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(independent_layers)]
-        )
-        self.tactile_blocks = nn.ModuleList(
-            [TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(independent_layers)]
-        )
-        self.fusion_blocks = nn.ModuleList(
-            [SharedBottleneckFusionLayer(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(fusion_layers)]
+        # ---- MBT Fusion Trunk (the ONLY difference from VisTacFusion) ----
+        ft_cfg = dict(fusion_trunk or {})
+        self.trunk = MBTFusionTrunk(
+            num_layers=ft_cfg.get("num_layers", 4),
+            dim=trunk_dim,
+            num_heads=ft_cfg.get("num_heads", 8),
+            num_bottleneck_tokens=ft_cfg.get("num_bottleneck_tokens", 4),
+            mlp_ratio=ft_cfg.get("mlp_ratio", 4),
+            dropout=ft_cfg.get("dropout", 0.1),
+            tap_layers=ft_cfg.get("tap_layers", [0, 1, 2, 3]),
         )
 
-        fused_dim = embed_dim * 3
-        self.norm = nn.LayerNorm(fused_dim) if task != "reconstruction" else None
-        self.classifier = (
-            MLPHead(fused_dim, num_classes, head_hidden_dim, head_layers, head_dropout)
-            if task == "classification"
-            else None
-        )
-        self.regressor = (
-            MLPHead(fused_dim, regression_dim, head_hidden_dim, head_layers, head_dropout)
-            if task == "regression"
-            else None
-        )
+        # ---- DPT path: encoder multiscale taps (1024) + RGB injection ----
+        self.dpt_pos = SpatialPosEmbedding(self.num_spatial, self.enc_dim)
 
-        # ---- Dense DPT decoder: uses encoder multiscale taps @ enc_dim ----
         dpt_cfg = dict(dpt or {})
+        num_heads = ft_cfg.get("num_heads", 8)
+        self.tap_inject = nn.ModuleList([
+            TapInjection(
+                q_dim=self.enc_dim,
+                kv_dim=trunk_dim,
+                num_heads=num_heads,
+                dropout=ft_cfg.get("dropout", 0.1),
+                gate_init=inject_gate_init,
+            )
+            for _ in range(4)
+        ])
+
+        self.dpt = DPTHead(
+            embed_dim=self.enc_dim,
+            features=dpt_cfg.get("features", 256),
+            dropout=dpt_cfg.get("dropout", 0.1),
+            out_depth_channels=dpt_cfg.get("out_depth_channels", 1),
+            out_normal_channels=dpt_cfg.get("out_normal_channels", 3),
+        )
+
+        # ---- Pose head (identical to VisTacFusion) ----
         pose_cfg = dict(pose or {})
-        self.dpt = (
-            DPTHead(
-                embed_dim=enc_dim,
-                features=dpt_cfg.get("features", 256),
-                dropout=dpt_cfg.get("dropout", 0.0),
-                out_depth_channels=dpt_cfg.get("out_depth_channels", 1),
-                out_normal_channels=dpt_cfg.get("out_normal_channels", 3),
-            )
-            if task == "reconstruction"
-            else None
-        )
-        # Spatial pos embedding for DPT taps (at encoder dim)
-        self.dpt_pos = (
-            nn.Parameter(torch.zeros(1, num_patches, enc_dim))
-            if task == "reconstruction"
-            else None
-        )
-        self.pose_head = (
-            PoseHead(
-                dim=embed_dim,
-                hidden_dim=pose_cfg.get("hidden_dim", 256),
-                dropout=pose_cfg.get("dropout", 0.1),
-                pose_mode=pose_cfg.get("pose_mode", "regression"),
-                rot_num_bins=pose_cfg.get("rot_num_bins", 72),
-                use_spatial_pool=pose_cfg.get("use_spatial_pool", True),
-            )
-            if task == "reconstruction"
-            else None
+        self.pose_head = PoseHead(
+            dim=trunk_dim,
+            hidden_dim=pose_cfg.get("hidden_dim", 256),
+            dropout=pose_cfg.get("dropout", 0.1),
+            pose_mode=pose_cfg.get("pose_mode", "regression"),
+            rot_num_bins=pose_cfg.get("rot_num_bins", 72),
+            use_spatial_pool=pose_cfg.get("use_spatial_pool", True),
         )
 
-        # Initialize ONLY the trainable modules; never touch the (pretrained/frozen) encoders.
-        trainable = [
-            self.rgb_proj,
-            self.tactile_proj,
-            self.rgb_blocks,
-            self.tactile_blocks,
-            self.fusion_blocks,
-        ]
-        for m in [self.norm, self.classifier, self.regressor, self.dpt, self.pose_head]:
-            if m is not None:
-                trainable.append(m)
-        for module in trainable:
-            module.apply(init_vit_weights)
-        nn.init.trunc_normal_(self.rgb_pos, std=0.02)
-        nn.init.trunc_normal_(self.tactile_pos, std=0.02)
-        nn.init.trunc_normal_(self.rgb_modality, std=0.02)
-        nn.init.trunc_normal_(self.tactile_modality, std=0.02)
-        nn.init.trunc_normal_(self.bottleneck, std=0.02)
-        nn.init.trunc_normal_(self.rgb_mask_token, std=0.02)
-        nn.init.trunc_normal_(self.tactile_mask_token, std=0.02)
-        if self.dpt_pos is not None:
-            nn.init.trunc_normal_(self.dpt_pos, std=0.02)
+        # ---- Initialize trainable modules ----
+        for m in [self.tactile_proj, self.rgb_proj, self.spatial_pos, self.dpt_pos,
+                  self.trunk, self.tap_inject, self.dpt, self.pose_head]:
+            m.apply(init_vit_weights)
 
-    def forward(self, rgb: torch.Tensor, tactile: torch.Tensor,
-                config: str = "both") -> ModelOutput:
+    def _build_pose_memory(self, rgb_patch, rgb_cls):
+        patch = self.rgb_proj(rgb_patch)
+        cls = self.rgb_proj(rgb_cls) if rgb_cls is not None else self.pose_mask.expand(patch.shape[0], -1, -1)
+        return torch.cat([patch, cls], dim=1)
+
+    def _build_pose_queries(self, tac_patch, tac_cls, use_tactile, B, device):
+        if use_tactile:
+            spatial = self.spatial_pos(self.tactile_proj(tac_patch))
+            pose_q = self.tactile_proj(tac_cls) if tac_cls is not None else self.pose_mask.expand(B, -1, -1)
+        else:
+            spatial = self.spatial_pos(self.spatial_mask.expand(B, -1, -1))
+            pose_q = self.pose_mask.expand(B, -1, -1)
+        return torch.cat([spatial, pose_q], dim=1)
+
+    def forward(self, rgb, tactile, config="both"):
         if config not in VALID_CONFIGS:
             raise ValueError(f"config must be one of {VALID_CONFIGS}, got {config!r}")
         use_rgb = config in ("both", "rgb")
         use_tactile = config in ("both", "tactile")
 
-        B = rgb.shape[0]
+        ref = tactile if use_tactile else rgb
+        B, device = ref.shape[0], ref.device
 
         # ---- Encode (frozen) ----
-        if use_rgb:
-            rgb_patch, _ = self.rgb_encoder(rgb)
+        tac_patch = tac_cls = rgb_patch = rgb_cls = None
         if use_tactile:
-            tactile_patch, _ = self.tactile_encoder(tactile)
-
-        # ---- Project to fusion dim, add pos + modality embeddings ----
+            tac_patch, tac_cls = self.tactile_encoder(tactile)
         if use_rgb:
-            rgb_tokens = self.rgb_proj(rgb_patch) + self.rgb_pos + self.rgb_modality
-        else:
-            rgb_tokens = self.rgb_mask_token.expand(B, self.rgb_pos.shape[1], -1) + self.rgb_pos + self.rgb_modality
+            rgb_patch, rgb_cls = self.rgb_encoder(rgb)
 
+        # ---- Pose path: projection → MBT trunk → pose head ----
+        pose_memory = self._build_pose_memory(rgb_patch, rgb_cls) if use_rgb else None
+        pose_queries = self._build_pose_queries(tac_patch, tac_cls, use_tactile, B, device)
+
+        trunk_taps, pose_token, bottleneck = self.trunk(pose_queries, pose_memory, use_rgb)
+
+        spatial_queries = trunk_taps[-1]
+        pose_out = self.pose_head(pose_token, spatial_queries=spatial_queries)
+
+        # ---- DPT path: encoder multiscale taps (1024) + RGB injection ----
         if use_tactile:
-            tactile_tokens = self.tactile_proj(tactile_patch) + self.tactile_pos + self.tactile_modality
+            ms = self.tactile_encoder.forward_multiscale(tactile)
         else:
-            tactile_tokens = self.tactile_mask_token.expand(B, self.tactile_pos.shape[1], -1) + self.tactile_pos + self.tactile_modality
+            ms = self.rgb_encoder.forward_multiscale(rgb)
+        dpt_taps = [self.dpt_pos(t) for t in ms]
 
-        # ---- Independent pre-fusion refinement ----
-        for rgb_block, tactile_block in zip(self.rgb_blocks, self.tactile_blocks):
-            rgb_tokens = rgb_block(rgb_tokens)
-            tactile_tokens = tactile_block(tactile_tokens)
+        if use_rgb:
+            dpt_taps = [inj(t, bottleneck)
+                        for inj, t in zip(self.tap_inject, dpt_taps)]
 
-        # ---- Shared bottleneck fusion ----
-        bottleneck = self.bottleneck.expand(B, -1, -1)
-        for fusion_block in self.fusion_blocks:
-            rgb_tokens, tactile_tokens, bottleneck = fusion_block(rgb_tokens, tactile_tokens, bottleneck)
+        depth, normal = self.dpt(dpt_taps, out_hw=(self.image_size, self.image_size))
 
-        # ---- DPT path: encoder multiscale taps (decoupled from fusion trunk) ----
-        depth = normal = se2 = None
-        if self.dpt is not None:
-            if use_tactile:
-                dpt_taps = self.tactile_encoder.forward_multiscale(tactile)
-            else:
-                dpt_taps = self.rgb_encoder.forward_multiscale(rgb)
-            dpt_taps = [t + self.dpt_pos for t in dpt_taps]
-            depth, normal = self.dpt(dpt_taps, out_hw=(self.image_size, self.image_size))
-
-        # ---- Pose path: from post-fusion tokens ----
-        if self.pose_head is not None:
-            if use_tactile:
-                pose_token = tactile_tokens.mean(dim=1, keepdim=True)
-                spatial_queries = tactile_tokens
-            else:
-                pose_token = rgb_tokens.mean(dim=1, keepdim=True)
-                spatial_queries = rgb_tokens
-            # Concatenate bottleneck info for richer pose signal
-            pose_token = pose_token + bottleneck.mean(dim=1, keepdim=True)
-            se2 = self.pose_head(pose_token, spatial_queries=spatial_queries)["se2"]
-
-        # The pooled global embedding / classifier / regressor are not used by the dense
-        # reconstruction head, so skip them (and their cost) for that task.
-        fused = logits = regression = None
-        if self.task != "reconstruction":
-            fused = self.pool(rgb_tokens, tactile_tokens, bottleneck)
-            logits = self.classifier(fused) if self.classifier is not None else None
-            regression = self.regressor(fused) if self.regressor is not None else None
-
-        return ModelOutput(
-            rgb_tokens=rgb_tokens,
-            tactile_tokens=tactile_tokens,
-            bottleneck_tokens=bottleneck,
-            fused_embedding=fused,
-            logits=logits,
-            regression=regression,
-            depth=depth,
-            normal=normal,
-            se2=se2,
-        )
-
-    def pool(self, rgb_tokens: torch.Tensor, tactile_tokens: torch.Tensor, bottleneck: torch.Tensor) -> torch.Tensor:
-        rgb_feat = rgb_tokens.mean(dim=1)
-        tactile_feat = tactile_tokens.mean(dim=1)
-        bottleneck_feat = bottleneck.mean(dim=1)
-        fused = torch.cat([rgb_feat, tactile_feat, bottleneck_feat], dim=-1)
-        return self.norm(fused) if self.norm is not None else fused
+        return ModelOutput(depth=depth, normal=normal, se2=pose_out["se2"])

@@ -72,7 +72,16 @@ def sync_config(config: str, device) -> str:
 
 
 def build_model_from_cfg(cfg: dict) -> SparshXTwoStreamFusionModel:
-    return SparshXTwoStreamFusionModel(**cfg["model"])
+    mcfg = cfg["model"]
+    return SparshXTwoStreamFusionModel(
+        image_size=mcfg.get("image_size", 224),
+        trunk_dim=mcfg.get("trunk_dim", 768),
+        encoder=mcfg.get("encoder"),
+        fusion_trunk=mcfg.get("fusion_trunk"),
+        dpt=mcfg.get("dpt"),
+        pose=mcfg.get("pose"),
+        inject_gate_init=mcfg.get("inject_gate_init", 0.0),
+    )
 
 
 def build_multitask_criterion(cfg: dict) -> MultiTaskLoss | None:
@@ -87,6 +96,8 @@ def build_multitask_criterion(cfg: dict) -> MultiTaskLoss | None:
 
 
 def _model_pred(out):
+    if isinstance(out, dict):
+        return {"depth": out["depth"], "normal": out["normal"], "se2": out["se2"]}
     return {"depth": out.depth, "normal": out.normal, "se2": out.se2}
 
 

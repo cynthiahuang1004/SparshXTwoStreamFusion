@@ -34,19 +34,8 @@ data:
 
 model:
   image_size: 224
-  patch_size: 16
-  in_chans: 3
-  embed_dim: 768
-  depth: 12
-  num_heads: 8
-  mlp_ratio: 4
-  independent_layers: 8
-  fusion_layers: 4
-  num_bottleneck_tokens: 4
-  dropout: 0.1
+  trunk_dim: 768
   task: reconstruction
-  num_classes: 4
-  regression_dim: 3
   encoder:
     name: dinov3_vitl16
     checkpoint: weights/dinov3_vitl16_pretrain_lvd1689m.pth
@@ -54,6 +43,14 @@ model:
     patch_size: 16
     share_encoder_weights: true
     multiscale_layers: [5, 11, 17, 23]
+  fusion_trunk:
+    num_layers: 4
+    num_bottleneck_tokens: 4
+    num_heads: 8
+    mlp_ratio: 4
+    dropout: 0.1
+    tap_layers: [0, 1, 2, 3]
+  inject_gate_init: 0.0
   dpt:
     features: 256
     dropout: 0.1
