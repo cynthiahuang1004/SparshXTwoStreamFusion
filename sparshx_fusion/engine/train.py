@@ -77,6 +77,7 @@ def build_model_from_cfg(cfg: dict) -> SparshXTwoStreamFusionModel:
         image_size=mcfg.get("image_size", 224),
         trunk_dim=mcfg.get("trunk_dim", 768),
         encoder=mcfg.get("encoder"),
+        rgb_encoder=mcfg.get("rgb_encoder"),
         fusion_trunk=mcfg.get("fusion_trunk"),
         dpt=mcfg.get("dpt"),
         pose=mcfg.get("pose"),

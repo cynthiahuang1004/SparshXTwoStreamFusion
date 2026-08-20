@@ -1,0 +1,119 @@
+seed: 0
+device: auto
+output_dir: outputs/SparshX
+
+data:
+  dataset: gs_blender_sim_real
+  image_size: 224
+  num_classes: 4
+  regression_dim: 3
+  gs_blender:
+    root: /media/hdd2/ihsuan/gs_blender/renders_v3
+    mesh_dir: /media/hdd2/ihsuan/gs_blender/meshes
+    rgb_dir: rgb
+    tactile_dir: samples
+    raw_dir: raw_data
+    use_gt_depth: true
+    use_rendered_normals: true
+    depth_scale: 1000.0
+    val_every: 20
+    augment: true
+    rot_augment: true
+    rot_augment_max_deg: 15.0
+    gel_view_m: 0.017502
+    align_real_rotation: true
+    rotation_windows: ablation/real_rotation_windows.json
+    train_samples_per_session: 315
+    include_objects:
+      - pattern_01_2_lines_angle_1_2
+      - pattern_01_2_lines_angle_2
+      - pattern_01_2_lines_angle_3
+      - pattern_04_3_lines_angle_1
+      - pattern_04_3_lines_angle_2
+      - pattern_06_5_lines_angle_1
+      - pattern_31_rod
+      - pattern_32
+      - pattern_33
+      - pattern_35
+      - pattern_36
+      - pattern_37
+  real:
+    root: /media/hdd2/ihsuan/gs_blender/real_filtered
+    mesh_dir: /media/hdd2/ihsuan/gs_blender/meshes
+    rgb_dir: rgb
+    tactile_dir: samples
+    raw_dir: raw_data
+    use_gt_depth: true
+    use_rendered_normals: false
+    val_every: 10
+    augment: false
+    oversample: 1
+
+model:
+  image_size: 224
+  trunk_dim: 768
+  task: reconstruction
+  encoder:
+    name: t3_large
+    checkpoint: weights/t3_large
+    embed_dim: 1024
+    patch_size: 16
+    share_encoder_weights: false
+  rgb_encoder:
+    name: mae_vitl16
+    checkpoint: weights/mae_vitl16.pth
+    embed_dim: 1024
+    patch_size: 16
+    multiscale_layers: [5, 11, 17, 23]
+  fusion_trunk:
+    num_layers: 4
+    num_bottleneck_tokens: 4
+    num_heads: 8
+    mlp_ratio: 4
+    dropout: 0.1
+    tap_layers: [0, 1, 2, 3]
+  inject_gate_init: 0.0
+  dpt:
+    features: 256
+    dropout: 0.1
+    out_depth_channels: 1
+    out_normal_channels: 3
+  pose:
+    hidden_dim: 256
+    dropout: 0.1
+    pose_mode: regression
+    rot_num_bins: 72
+    use_spatial_pool: true
+
+loss:
+  depth:
+    type: mse
+    grad_matching_weight: 0.0
+    weight: 1.0
+  normal:
+    type: mse
+    weight: 1.0
+  pose:
+    rot_weight: 1.0
+    trans_weight: 1.0
+    weight: 1.0
+  uncertainty_weighting: true
+  grouped_uncertainty: true
+  dense_pose_ratio: 1.0
+
+modality_dropout:
+  enabled: true
+  p_both: 0.55
+  p_tactile_only: 0.35
+  p_rgb_only: 0.10
+
+train:
+  epochs: 150
+  batch_size: 32
+  num_workers: 8
+  lr: 0.0002
+  weight_decay: 0.05
+  warmup_steps: 1000
+  min_lr_ratio: 0.01
+  log_every: 50
+  amp: true

@@ -190,6 +190,7 @@ def scan_gs_blender(
     raw_dir: str = "raw_data",
     require_depth: bool = False,
     use_gt_depth: bool = True,
+    include_objects: list[str] | None = None,
 ) -> dict[tuple[str, str], list[dict[str, str]]]:
     """Scan the gs_blender renders layout into (object, session) -> samples.
 
@@ -206,8 +207,11 @@ def scan_gs_blender(
     if not root.exists():
         raise FileNotFoundError(f"gs_blender root does not exist: {root}")
     depth_suffix = "_gt" if use_gt_depth else ""
+    incl = set(include_objects) if include_objects else None
     groups: dict[tuple[str, str], list[dict[str, str]]] = {}
     for obj_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        if incl and obj_dir.name not in incl:
+            continue
         for session_dir in sorted(obj_dir.glob("session_*")):
             for sensor_dir in sorted(session_dir.glob("sensor_*")):
                 rgb_root = sensor_dir / rgb_dir
@@ -528,11 +532,62 @@ def _build_gs_blender_recon(cfg: Any, image_size: int):
     return train_ds, val_ds
 
 
+def _filter_sessions_by_rotation_window(groups, rotation_windows):
+    """Drop sessions whose base rotation falls outside the real rotation window."""
+    filtered = {}
+    dropped = 0
+    for (obj, session), samples in groups.items():
+        window = rotation_windows.get(obj)
+        if window is None:
+            filtered[(obj, session)] = samples
+            continue
+        sj_path = samples[0].get("session_json", "")
+        if not sj_path or not Path(sj_path).exists():
+            filtered[(obj, session)] = samples
+            continue
+        with open(sj_path) as f:
+            sj = json.load(f)
+        base_rot = sj.get("rotation_euler", sj.get("base_rotation", [0, 0, 0]))
+        rot_deg = math.degrees(base_rot[2]) % 360
+        lo, hi = window
+        lo_norm = lo % 360
+        hi_norm = hi % 360
+        if lo_norm <= hi_norm:
+            inside = lo_norm <= rot_deg <= hi_norm
+        else:
+            inside = rot_deg >= lo_norm or rot_deg <= hi_norm
+        if inside:
+            filtered[(obj, session)] = samples
+        else:
+            dropped += 1
+    if dropped:
+        print(f"  rotation_windows: dropped {dropped} sessions outside real rotation range")
+    return filtered
+
+
+def _subsample_per_session(groups, train_samples_per_session):
+    """Deterministically subsample each session to at most k samples (np.linspace)."""
+    out = {}
+    for key, samples in groups.items():
+        k = int(train_samples_per_session)
+        if k <= 0:
+            continue
+        if len(samples) <= k:
+            out[key] = samples
+        else:
+            pos = np.linspace(0, len(samples) - 1, k).round().astype(int)
+            out[key] = [samples[i] for i in sorted(set(pos.tolist()))]
+    return out
+
+
 def _build_gs_blender_recon_sim_real(cfg: Any, image_size: int):
     """Build (train_ds, val_ds) for sim+real co-training.
 
-    Sim data: augmented, with rendered normals.
-    Real data: no augmentation, no rendered normals, oversampled.
+    Supports VisTacFusion-compatible features:
+      - train_samples_per_session: cap sim samples per session (deterministic linspace)
+      - include_objects: filter to specific objects
+      - align_real_rotation + rotation_windows: filter sim sessions to real rotation range
+      - real data from separate root (e.g. real_filtered)
     Val = real val only (to measure real-data generalization).
     """
     from torch.utils.data import ConcatDataset
@@ -541,6 +596,7 @@ def _build_gs_blender_recon_sim_real(cfg: Any, image_size: int):
     real_cfg = cfg["data"]["real"]
 
     # ---- Sim datasets ----
+    sim_include = sim_cfg.get("include_objects")
     sim_groups = scan_gs_blender(
         sim_cfg["root"],
         rgb_dir=sim_cfg.get("rgb_dir", "rgb"),
@@ -548,11 +604,29 @@ def _build_gs_blender_recon_sim_real(cfg: Any, image_size: int):
         raw_dir=sim_cfg.get("raw_dir", "raw_data"),
         require_depth=True,
         use_gt_depth=sim_cfg.get("use_gt_depth", True),
+        include_objects=sim_include,
     )
+
+    if sim_cfg.get("align_real_rotation") and sim_cfg.get("rotation_windows"):
+        rw_path = sim_cfg["rotation_windows"]
+        with open(rw_path) as f:
+            rotation_windows = json.load(f)
+        sim_groups = _filter_sessions_by_rotation_window(sim_groups, rotation_windows)
+
     val_every = sim_cfg.get("val_every", 20)
-    sim_all = [s for k in sorted(sim_groups.keys()) for s in sim_groups[k]]
-    sim_train_samples = [s for s in sim_all if int(Path(s["rgb"]).stem) % val_every != 0]
-    sim_val_samples = [s for s in sim_all if int(Path(s["rgb"]).stem) % val_every == 0]
+    sim_train_groups = {}
+    sim_val_samples = []
+    for key, samples in sorted(sim_groups.items()):
+        train = [s for s in samples if int(Path(s["rgb"]).stem) % val_every != 0]
+        val = [s for s in samples if int(Path(s["rgb"]).stem) % val_every == 0]
+        sim_train_groups[key] = train
+        sim_val_samples.extend(val)
+
+    tps = sim_cfg.get("train_samples_per_session")
+    if tps is not None:
+        sim_train_groups = _subsample_per_session(sim_train_groups, tps)
+
+    sim_train_samples = [s for k in sorted(sim_train_groups.keys()) for s in sim_train_groups[k]]
 
     depth_scale = sim_cfg.get("depth_scale", 1000.0)
     mesh_dir = sim_cfg.get("mesh_dir")
@@ -571,6 +645,7 @@ def _build_gs_blender_recon_sim_real(cfg: Any, image_size: int):
     )
 
     # ---- Real datasets ----
+    real_include = real_cfg.get("include_objects", sim_include)
     real_groups = scan_gs_blender(
         real_cfg["root"],
         rgb_dir=real_cfg.get("rgb_dir", "rgb"),
@@ -578,25 +653,27 @@ def _build_gs_blender_recon_sim_real(cfg: Any, image_size: int):
         raw_dir=real_cfg.get("raw_dir", "raw_data"),
         require_depth=True,
         use_gt_depth=real_cfg.get("use_gt_depth", True),
+        include_objects=real_include,
     )
-    real_val_every = real_cfg.get("val_every", 20)
+    real_val_every = real_cfg.get("val_every", 10)
     real_all = [s for k in sorted(real_groups.keys()) for s in real_groups[k]]
     real_train_samples = [s for s in real_all if int(Path(s["rgb"]).stem) % real_val_every != 0]
     real_val_samples = [s for s in real_all if int(Path(s["rgb"]).stem) % real_val_every == 0]
 
     real_mesh_dir = real_cfg.get("mesh_dir", mesh_dir)
+    real_augment = real_cfg.get("augment", False)
     real_train_ds = GsBlenderDepthDataset(
         real_train_samples, root=real_cfg["root"], image_size=image_size,
         depth_scale=depth_scale, mesh_dir=real_mesh_dir,
-        augment=False, gel_view_m=gel_view_m,
-        use_rendered_normals=False,
+        augment=real_augment, gel_view_m=gel_view_m,
+        use_rendered_normals=real_cfg.get("use_rendered_normals", False),
         use_gt_depth=real_cfg.get("use_gt_depth", True),
     )
     real_val_ds = GsBlenderDepthDataset(
         real_val_samples, root=real_cfg["root"], image_size=image_size,
         depth_scale=depth_scale, mesh_dir=real_mesh_dir,
         augment=False, gel_view_m=gel_view_m,
-        use_rendered_normals=False,
+        use_rendered_normals=real_cfg.get("use_rendered_normals", False),
         use_gt_depth=real_cfg.get("use_gt_depth", True),
     )
 
@@ -608,8 +685,8 @@ def _build_gs_blender_recon_sim_real(cfg: Any, image_size: int):
     train_ds = ConcatDataset([sim_train_ds] + [real_train_ds] * oversample)
     val_ds = real_val_ds
 
-    print(f"sim+real co-training: sim={len(sim_train_samples)}+{len(sim_val_samples)}, "
-          f"real={len(real_train_samples)}+{len(real_val_samples)} (oversample {oversample}x)")
+    print(f"sim+real co-training: sim_train={len(sim_train_samples)}, sim_val={len(sim_val_samples)}, "
+          f"real_train={len(real_train_samples)}, real_val={len(real_val_samples)} (oversample {oversample}x)")
     print(f"  train total={len(train_ds)}, val={len(val_ds)} (real only)")
     return train_ds, val_ds
 

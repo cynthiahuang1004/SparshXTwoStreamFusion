@@ -149,6 +149,7 @@ class SparshXTwoStreamFusionModel(nn.Module):
         image_size: int = 224,
         trunk_dim: int = 768,
         encoder: dict | None = None,
+        rgb_encoder: dict | None = None,
         fusion_trunk: dict | None = None,
         dpt: dict | None = None,
         pose: dict | None = None,
@@ -161,19 +162,23 @@ class SparshXTwoStreamFusionModel(nn.Module):
 
         # ---- Encoder (frozen) ----
         enc_cfg = dict(encoder or {})
-        multiscale_layers = enc_cfg.pop("multiscale_layers", [5, 11, 17, 23])
-        enc_cfg["multiscale_layers"] = multiscale_layers
         self.tactile_encoder = build_encoder(enc_cfg, image_size)
-        if enc_cfg.get("share_encoder_weights", True):
+
+        if rgb_encoder is not None:
+            rgb_enc_cfg = dict(rgb_encoder)
+            self.rgb_encoder = build_encoder(rgb_enc_cfg, image_size)
+        elif enc_cfg.get("share_encoder_weights", True):
             self.rgb_encoder = self.tactile_encoder
         else:
             self.rgb_encoder = build_encoder(enc_cfg, image_size)
+
         self.enc_dim = self.tactile_encoder.embed_dim
+        self.rgb_enc_dim = self.rgb_encoder.embed_dim
         self.num_spatial = self.tactile_encoder.num_patches
 
         # ---- Pose path: projection (enc_dim→trunk_dim) ----
         self.tactile_proj = BranchProjection(self.enc_dim, trunk_dim)
-        self.rgb_proj = BranchProjection(self.enc_dim, trunk_dim)
+        self.rgb_proj = BranchProjection(self.rgb_enc_dim, trunk_dim)
         self.spatial_pos = SpatialPosEmbedding(self.num_spatial, trunk_dim)
 
         self.spatial_mask = nn.Parameter(torch.zeros(1, self.num_spatial, trunk_dim))
