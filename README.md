@@ -67,3 +67,29 @@ sample_001.png,1
 
 For regression, use columns `target_0`, `target_1`, etc. The dataset code is intentionally small so it can be adapted to your exact MuxGel/real capture naming convention.
 
+## Aligned training with VisTacFusion (current workflow)
+
+`sparshx_fusion/engine/train.py` is now a thin wrapper around **VisTacFusion's** trainer
+(`vistacfusion.engine.train`, `model_type: external`). Data processing (fixed crop, sim RGB
+zoom, translation filter, rotation alignment, gel-spin augmentation with camera-frame xy
+labels, sim oversampling), losses, modality dropout, optimizer/schedule, evaluation and
+checkpoint selection are therefore *the same code* as the VisTacFusion runs this baseline is
+compared against. The model (`sparshx_fusion/models/vtf_model.py`) is built from VisTacFusion
+components (frozen encoders, projection, DPT/Pose heads, object embedding, TapInjection);
+the only difference is the symmetric shared-bottleneck **MBT trunk** (`MBTFusionTrunk`).
+
+```bash
+cd /media/hdd2/ihsuan/SparshXTwoStreamFusion && conda activate vistacfusion
+# bundle = model config here + train/data configs taken from the VisTacFusion repo
+CUDA_VISIBLE_DEVICES=3 python -m sparshx_fusion.engine.train --config configs/run_sim348_crop816.yaml
+# or explicitly (relative --train/--data resolve against $VTF_ROOT = /media/hdd2/ihsuan/VisTacFusion)
+python -m sparshx_fusion.engine.train --model configs/vtf_model_sparshx_t3mae.yaml \
+    --train configs/train_bs32.yaml \
+    --data ablation/simqty_gtac/data_ratio_g3s_sim348_transfilt_zoom115_crop816.yaml \
+    --output-dir outputs/base_sparshx_c816_sim348
+```
+Outputs (history.json, best_depth.pt, best_pose.pt, latest.pt) have the VisTacFusion layout, so
+`VisTacFusion/scripts/plot_ratio_ladder.py::load_best_per_mode` and
+`python -m vistacfusion.engine.inference --model configs/vtf_model_sparshx_t3mae.yaml ...`
+work unchanged. Large outputs live on `/media/hdd/ihsuan/SparshX_outputs/` (symlinked from `outputs/`).
+The previous standalone trainer is kept as `sparshx_fusion/engine/train_legacy.py`.

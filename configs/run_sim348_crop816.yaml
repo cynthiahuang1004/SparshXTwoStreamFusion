@@ -1,0 +1,6 @@
+# Bundle for sparshx_fusion.engine.train: same train/data configs as the VisTacFusion
+# sim348 (real:sim 1:2.98) / fixed_crop 0.816 / transfilt / sim RGB zoom 1.15 / no real aug run.
+model: configs/vtf_model_sparshx_t3mae.yaml
+train: configs/train_bs32.yaml                                                   # relative to VisTacFusion
+data: ablation/simqty_gtac/data_ratio_g3s_sim348_transfilt_zoom115_crop816.yaml  # relative to VisTacFusion
+output_dir: outputs/base_sparshx_c816_sim348
