@@ -1,0 +1,5 @@
+# SparshX MBT baseline at the SiTR+MAE optimum: sim148 (real:sim 1:1.27), crop 0.816, transfilt, zoom 1.15
+model: configs/vtf_model_sparshx_sitrmae.yaml
+train: configs/train_bs32.yaml
+data: ablation/simqty_gtac/data_ratio_g3s_sim148_transfilt_zoom115_crop816.yaml
+output_dir: outputs/base_sparshx_sitrmae_c816_sim148

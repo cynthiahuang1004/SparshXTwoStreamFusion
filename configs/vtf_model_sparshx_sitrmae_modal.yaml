@@ -1,0 +1,64 @@
+# SparshX MBT-fusion baseline, SiTR + MAE encoders (copied from VisTacFusion/ablation/encoder/tac_sitr_rgb_mae.yaml);
+# only fusion_trunk differs from VisTacFusion. Trained through vistacfusion.engine.train (model_type: external).
+model_type: external
+external:
+  import_path: sparshx_fusion.models.vtf_model:build_model
+  sys_path:
+  - /sparshx
+image_size: 224
+trunk_dim: 768
+encoder:
+  name: sitr_b18
+  checkpoint: /media/hdd2/ihsuan/gsrl/datasets/checkpoints/SITR_B18.pth
+  calibration_dir: /media/hdd2/ihsuan/gs_blender/renders_v3/pattern_01_2_lines_angle_1_2/session_000/sensor_0000/calibration
+  num_calibration: 18
+  embed_dim: 768
+  patch_size: 16
+  frozen: true
+  share_encoder_weights: false
+  keep_cls: true
+rgb_encoder:
+  name: mae_vitl16
+  checkpoint: pretrained_encoders/mae_vitl16.pth
+  embed_dim: 1024
+  patch_size: 16
+projection:
+  out_dim: 768
+  modality_embedding: true
+  rgb_positional_embedding: false
+  tactile_positional_embedding: true
+tokens:
+  num_spatial_queries: 196
+  num_pose_queries: 1
+  object_embedding: true
+  num_objects: 20
+fusion_trunk:
+  num_layers: 4
+  num_bottleneck_tokens: 4
+  num_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  tap_layers:
+  - 0
+  - 1
+  - 2
+  - 3
+heads:
+  dpt:
+    features: 256
+    dropout: 0.1
+    out_depth_channels: 1
+    out_normal_channels: 3
+    output_frame: tactile
+    encoder_tap_layers:
+    - 2
+    - 5
+    - 8
+    - 11
+    inject_gate_init: 0.0
+  pose:
+    hidden_dim: 256
+    dropout: 0.1
+    pose_mode: regression
+    rot_num_bins: 72
+    use_spatial_pool: true
