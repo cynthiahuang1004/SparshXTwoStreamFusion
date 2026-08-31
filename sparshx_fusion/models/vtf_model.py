@@ -79,6 +79,10 @@ class SparshXTwoStreamFusionVTF(nn.Module):
 
         # ---- DPT path: encoder multiscale taps + gated RGB injection (as VisTacFusion) ----
         self.dpt_pos = SpatialPosEmbedding(self.num_spatial, self.enc_dim)
+        self.rgb_tap_proj = None                     # as VisTacFusion: rgb-only DPT fallback
+        if self.rgb_enc_dim != self.enc_dim:
+            self.rgb_tap_proj = nn.ModuleList(
+                [nn.Linear(self.rgb_enc_dim, self.enc_dim) for _ in range(4)])
         self.tap_inject = nn.ModuleList([
             TapInjection(q_dim=self.enc_dim, kv_dim=self.trunk_dim,
                          num_heads=ft.get("num_heads", 8), dropout=ft.get("dropout", 0.1),
@@ -149,12 +153,12 @@ class SparshXTwoStreamFusionVTF(nn.Module):
         if use_tactile:
             ms = tac_ms if tac_ms is not None else self.tactile_encoder.forward_multiscale(tactile)
             dpt_taps = [self.dpt_pos(t) for t in ms]
-        elif self.rgb_enc_dim == self.enc_dim:   # token grid resampled if patch sizes differ (as VTF)
+        else:   # rgb-only DPT fallback (as VTF): dim projection if needed + grid resampling
             ms = rgb_ms if rgb_ms is not None else self.rgb_encoder.forward_multiscale(rgb)
+            if self.rgb_tap_proj is not None:
+                ms = [proj(t) for proj, t in zip(self.rgb_tap_proj, ms)]
             ms = [_resample_tokens(t, self.num_spatial) for t in ms]
             dpt_taps = [self.dpt_pos(t) for t in ms]
-        else:
-            dpt_taps = None
 
         if dpt_taps is not None:
             if inject_rgb_to_dpt and use_rgb:
