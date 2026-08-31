@@ -19,7 +19,7 @@ import torch.nn as nn
 from vistacfusion.models.encoders import build_encoder
 from vistacfusion.models.heads.dpt import DPTHead
 from vistacfusion.models.heads.pose import PoseHead
-from vistacfusion.models.model import VALID_CONFIGS, TapInjection, _config_flags
+from vistacfusion.models.model import VALID_CONFIGS, TapInjection, _config_flags, _resample_tokens
 from vistacfusion.models.projection import BranchProjection, SpatialPosEmbedding
 
 from .layers import init_vit_weights
@@ -149,8 +149,9 @@ class SparshXTwoStreamFusionVTF(nn.Module):
         if use_tactile:
             ms = tac_ms if tac_ms is not None else self.tactile_encoder.forward_multiscale(tactile)
             dpt_taps = [self.dpt_pos(t) for t in ms]
-        elif self.rgb_enc_dim == self.enc_dim and self.rgb_encoder.num_patches == self.num_spatial:
+        elif self.rgb_enc_dim == self.enc_dim:   # token grid resampled if patch sizes differ (as VTF)
             ms = rgb_ms if rgb_ms is not None else self.rgb_encoder.forward_multiscale(rgb)
+            ms = [_resample_tokens(t, self.num_spatial) for t in ms]
             dpt_taps = [self.dpt_pos(t) for t in ms]
         else:
             dpt_taps = None
